@@ -200,7 +200,7 @@ services:
   # In the Cloudflare dashboard, point the public hostname at the service URL http://caddy:8080
   cloudflared:
     container_name: cloudflared
-    image: cloudflare/cloudflared:2026.10.7
+    image: cloudflare/cloudflared:latest
     profiles:
       - tunnel
     restart: unless-stopped
