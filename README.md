@@ -28,7 +28,7 @@ backend shut down. The `init` service now creates the files and fixes ownership 
 
 ### 1. (Optional) Configure
 
-Create a `.env` file next to `docker-compose.yml` (or set these as Dockhand stack variables):
+Create a `.env` file (or copy `.env.dist` to `.env`) next to `docker-compose.yml` (or set these as Dockhand stack variables):
 
 ```env
 DJANGO_SUPERUSER_EMAIL=you@example.com
