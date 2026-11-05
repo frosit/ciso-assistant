@@ -1,0 +1,184 @@
+# CISO Assistant - self-contained stack (named volumes, no helper scripts).
+#
+# Root cause of the former sqlite3 / huey failure: /code/db does not exist in the
+# backend image (it is .dockerignored), so a fresh volume mounted there is owned by
+# root while the containers run as 1001:1001 -> sqlite cannot create its files.
+# The one-shot "init" service below fixes ownership and creates the Django secret key
+# (what docker-compose.sh / startup.sh did by hand), so no bash files are required.
+#
+# Start:  docker compose up -d
+# URL:    https://localhost:8443  (login: DJANGO_SUPERUSER_EMAIL / DJANGO_SUPERUSER_PASSWORD)
+# MCP:    docker compose --profile mcp up -d   (served at https://localhost:8443/mcp)
+# Reset:  docker compose down -v
+
+name: ciso-assistant
+
+x-backend-env: &backend-env
+  ALLOWED_HOSTS: backend,localhost
+  CISO_ASSISTANT_URL: ${CISO_ASSISTANT_URL:-https://localhost:8443}
+  AUTH_TOKEN_TTL: "7200"
+  HOME: /tmp
+  XDG_CACHE_HOME: /tmp/.cache
+  XDG_CONFIG_HOME: /tmp/.config
+  XDG_DATA_HOME: /tmp/.local/share
+  QDRANT_URL: http://qdrant:6333
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev
+
+services:
+  # One-shot: prepares the db volume for the non-root (1001) backend/huey containers.
+  init:
+    container_name: ciso-init
+    image: busybox:1.37
+    user: "0:0"
+    restart: "no"
+    volumes:
+      - ciso_db:/db
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        if [ ! -s /db/django_secret_key ]; then
+          head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /db/django_secret_key
+          echo "generated Django secret key"
+        fi
+        chmod 600 /db/django_secret_key
+        mkdir -p /db/attachments
+        chown -R 1001:1001 /db
+        chmod 700 /db
+
+  backend:
+    container_name: backend
+    image: ghcr.io/intuitem/ciso-assistant-community/backend:latest
+    pull_policy: always
+    restart: always
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      <<: *backend-env
+      DJANGO_DEBUG: "True"
+      # Creates the initial admin non-interactively (replaces `exec ... createsuperuser`).
+      # Change the password after first login.
+      DJANGO_SUPERUSER_EMAIL: ${DJANGO_SUPERUSER_EMAIL:-admin@example.com}
+      DJANGO_SUPERUSER_PASSWORD: ${DJANGO_SUPERUSER_PASSWORD:-ChangeMe-123!}
+    <<: *hardening
+    volumes:
+      - ciso_db:/code/db
+    user: "1001:1001"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/', timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 150s
+
+  huey:
+    container_name: huey
+    image: ghcr.io/intuitem/ciso-assistant-community/backend:latest
+    pull_policy: always
+    restart: always
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      <<: *backend-env
+      DJANGO_DEBUG: "False"
+    <<: *hardening
+    volumes:
+      - ciso_db:/code/db
+    # Same secret key as the backend (startup.sh is bypassed here, so read it from the volume).
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        export DJANGO_SECRET_KEY="$$(cat /code/db/django_secret_key)"
+        exec python manage.py run_huey -w 2 --scheduler-interval 60
+    user: "1001:1001"
+
+  frontend:
+    container_name: frontend
+    image: ghcr.io/intuitem/ciso-assistant-community/frontend:latest
+    pull_policy: always
+    restart: always
+    environment:
+      PUBLIC_BACKEND_API_URL: http://backend:8000/api
+      PUBLIC_BACKEND_API_EXPOSED_URL: ${CISO_ASSISTANT_URL:-https://localhost:8443}/api
+      PROTOCOL_HEADER: x-forwarded-proto
+      HOST_HEADER: x-forwarded-host
+    <<: *hardening
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  qdrant:
+    container_name: qdrant
+    image: qdrant/qdrant:v1.19.1
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - 127.0.0.1:6333:6333
+
+  # MCP server for external AI orchestrators. Opt-in: `docker compose --profile mcp up -d`.
+  # No `ports:` - reachable only through caddy at /mcp.
+  mcp:
+    container_name: mcp
+    image: ghcr.io/intuitem/ciso-assistant-community/mcp:latest
+    pull_policy: always
+    profiles:
+      - mcp
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      API_URL: http://backend:8000/api
+      CA_MCP_TRANSPORT: streamable-http
+      CA_MCP_HOST: 0.0.0.0
+      CA_MCP_PORT: "8001"
+      CA_MCP_READ_ONLY: "true"
+      # Matched against the Host header (port included); does not set the bind address.
+      CA_MCP_ALLOWED_HOSTS: ${CA_MCP_ALLOWED_HOSTS:-localhost:8443}
+      # Each caller presents its own personal access token.
+      CA_MCP_ALLOW_ENV_TOKEN: "false"
+      HOME: /tmp
+      XDG_CACHE_HOME: /tmp/.cache
+      XDG_CONFIG_HOME: /tmp/.config
+      XDG_DATA_HOME: /tmp/.local/share
+    <<: *hardening
+    user: "1001:1001"
+
+  caddy:
+    container_name: caddy
+    image: caddy:2.11.4
+    restart: unless-stopped
+    environment:
+      CISO_ASSISTANT_URL: ${CISO_ASSISTANT_URL:-https://localhost:8443}
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - 127.0.0.1:8443:8443
+    volumes:
+      - caddy_data:/data
+    command: |
+      sh -c 'echo $$CISO_ASSISTANT_URL "{
+      reverse_proxy /api/* backend:8000
+      reverse_proxy /mcp* mcp:8001
+      reverse_proxy /* frontend:3000
+      tls internal
+      }" > Caddyfile && caddy run'
+
+volumes:
+  ciso_db:
+  qdrant_data:
+  caddy_data:
