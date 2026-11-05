@@ -9,12 +9,14 @@
 # Start:  docker compose up -d
 # URL:    https://localhost:8443  (login: DJANGO_SUPERUSER_EMAIL / DJANGO_SUPERUSER_PASSWORD)
 # MCP:    docker compose --profile mcp up -d   (served at https://localhost:8443/mcp)
+# Tunnel: docker compose --profile tunnel up -d  (see README: Cloudflare Tunnel)
 # Reset:  docker compose down -v
 
 name: ciso-assistant
 
 x-backend-env: &backend-env
-  ALLOWED_HOSTS: backend,localhost
+  # Add the public hostname when using the tunnel, e.g. ALLOWED_HOSTS=backend,localhost,ciso.example.com
+  ALLOWED_HOSTS: ${ALLOWED_HOSTS:-backend,localhost}
   CISO_ASSISTANT_URL: ${CISO_ASSISTANT_URL:-https://localhost:8443}
   AUTH_TOKEN_TTL: "7200"
   HOME: /tmp
@@ -170,13 +172,48 @@ services:
       - 127.0.0.1:8443:8443
     volumes:
       - caddy_data:/data
+    # Two entry points sharing the same routes:
+    #  - $CISO_ASSISTANT_URL: HTTPS with Caddy's internal CA (published on 127.0.0.1:8443)
+    #  - http://:8080: plain HTTP, NOT published; only for cloudflared on the compose network.
+    #    TLS ends at Cloudflare, so the original scheme/host are forwarded explicitly.
     command: |
-      sh -c 'echo $$CISO_ASSISTANT_URL "{
-      reverse_proxy /api/* backend:8000
+      sh -c 'echo "(app) {
+      reverse_proxy /api/* backend:8000 {
+      header_up X-Forwarded-Proto https
+      header_up X-Forwarded-Host {host}
+      }
       reverse_proxy /mcp* mcp:8001
-      reverse_proxy /* frontend:3000
+      reverse_proxy /* frontend:3000 {
+      header_up X-Forwarded-Proto https
+      header_up X-Forwarded-Host {host}
+      }
+      }
+      $$CISO_ASSISTANT_URL {
+      import app
       tls internal
+      }
+      http://:8080 {
+      import app
       }" > Caddyfile && caddy run'
+
+  # Cloudflare Tunnel. Opt-in: `docker compose --profile tunnel up -d` (needs CLOUDFLARE_TUNNEL_TOKEN).
+  # In the Cloudflare dashboard, point the public hostname at the service URL http://caddy:8080
+  cloudflared:
+    container_name: cloudflared
+    image: cloudflare/cloudflared:2026.10.7
+    profiles:
+      - tunnel
+    restart: unless-stopped
+    depends_on:
+      - caddy
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    command: tunnel --no-autoupdate run
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   ciso_db:

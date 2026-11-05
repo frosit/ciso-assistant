@@ -64,3 +64,24 @@ Not tested: login in a browser with the auto-created superuser, and running insi
 - `pull_policy: always` pulls `:latest` images on every `up`. Pin tags for reproducible deployments.
 - `DJANGO_DEBUG=True` on the backend is kept from upstream; set it to `False` for anything beyond local development.
 - `docker compose down -v` deletes all data (database, secret key, attachments, Caddy CA).
+
+## Addendum: Cloudflare Tunnel support
+
+| Change | Why |
+| --- | --- |
+| New opt-in `cloudflared` service (`profiles: [tunnel]`, image `cloudflare/cloudflared:2026.10.7`, token via `CLOUDFLARE_TUNNEL_TOKEN`) | Remotely managed tunnel: no ports opened, no config file or script needed. |
+| Caddy gets a second site `http://:8080` (not published) sharing the app routes via a `(app)` snippet | The existing site is HTTPS with an internal CA for one hostname; cloudflared needs a plain HTTP origin that accepts any Host header. Reachable only on the compose network. |
+| Caddy forces `X-Forwarded-Proto https` and `X-Forwarded-Host {host}` towards backend/frontend | TLS ends at Cloudflare, so Caddy sees HTTP. Without this the SvelteKit frontend computes an `http://` origin and rejects form POSTs (CSRF), and Django would not treat the request as secure. |
+| `ALLOWED_HOSTS` is now `${ALLOWED_HOSTS:-backend,localhost}` | Django rejects Host headers not listed; the public hostname must be added. Default behaviour unchanged. |
+
+Verification (stack `tunneltest`, `CISO_ASSISTANT_URL=https://ciso.example.com`, fake token):
+
+- From a container on the compose network, with `Host: ciso.example.com`: `http://caddy:8080/api/health/` -> 200,
+  `/login` -> 200, `/` -> 302.
+- Form POST with `Origin: https://ciso.example.com` passes the frontend CSRF check; with a foreign Origin it
+  returns 403 (`Cross-site POST form submissions are forbidden`). A request with an unlisted Host is rejected by Django.
+- `cloudflared` starts with the given command and stops at token validation ("Provided Tunnel token is not valid"),
+  as expected with a fake token.
+- Test stack removed afterwards.
+
+Not tested: a real Cloudflare tunnel and public hostname (needs an account and token), and the MCP route through the tunnel.
